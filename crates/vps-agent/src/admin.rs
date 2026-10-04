@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use vps_agent_core::names::validate_group_name;
 use vps_agent_core::paths::{
     AGENT_USER, HELPER_BIN, JOB_DIR, LOG_DIR, MANAGED_GROUP, POLICY_FILE, PRIV_DIR, REGISTRY_FILE,
-    SUDOERS_DISABLED, SUDOERS_FILE,
+    SSHD_DROPIN, SSHD_DROPIN_DISABLED, SUDOERS_DISABLED, SUDOERS_FILE,
 };
 use vps_agent_core::policy::{CompiledPolicy, Policy};
 use vps_agent_core::registry::{lock, Registry, UserEntry};
@@ -28,7 +28,7 @@ fn capture(program: &str, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn run(program: &str, args: &[&str]) -> Result<(), String> {
+pub fn run(program: &str, args: &[&str]) -> Result<(), String> {
     let out = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -39,6 +39,23 @@ fn run(program: &str, args: &[&str]) -> Result<(), String> {
     } else {
         Err(format!("{program} {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()))
     }
+}
+
+/// Installs a root-owned file with the given mode and group. Root only.
+pub fn write_root_file(path: &str, content: &str, mode: &str, group: &str) -> Result<(), String> {
+    require_root()?;
+    let tmp = format!("{path}.tmp-{}", std::process::id());
+    std::fs::write(&tmp, content).map_err(|e| format!("{tmp}: {e}"))?;
+    let installed = run("install", &["-m", mode, "-o", "root", "-g", group, &tmp, path]);
+    let _ = std::fs::remove_file(&tmp);
+    installed
+}
+
+const HTTP_UNIT: &str = "/etc/systemd/system/vps-agent-http.service";
+
+// The unit is called ssh on Debian and Ubuntu, sshd elsewhere.
+fn reload_sshd() -> Result<(), String> {
+    run("systemctl", &["reload", "ssh"]).or_else(|_| run("systemctl", &["reload", "sshd"]))
 }
 
 fn require_root() -> Result<(), String> {
@@ -89,6 +106,16 @@ pub fn off() -> Result<(), String> {
         std::fs::rename(&keys, disabled(&keys)).map_err(|e| format!("{}: {e}", keys.display()))?;
         println!("SSH key disabled");
     }
+    if Path::new(SSHD_DROPIN).exists() {
+        run("mv", &["-f", SSHD_DROPIN, SSHD_DROPIN_DISABLED])?;
+        reload_sshd()?;
+        println!("certificate login disabled");
+    }
+    // The HTTP endpoint is another way in; it only exists when serve-http was set up.
+    if Path::new(HTTP_UNIT).exists() {
+        let _ = Command::new("systemctl").args(["disable", "--now", "vps-agent-http"]).status();
+        println!("HTTP endpoint stopped");
+    }
     let reg = Registry::load(Path::new(REGISTRY_FILE))?;
     for user in std::iter::once(AGENT_USER).chain(reg.users.keys().map(String::as_str)) {
         // pkill exits 1 when the user has no processes.
@@ -113,6 +140,20 @@ pub fn on() -> Result<(), String> {
             std::fs::rename(&off, &keys).map_err(|e| format!("{}: {e}", off.display()))?;
             println!("SSH key restored");
         }
+    }
+    if Path::new(SSHD_DROPIN_DISABLED).exists() {
+        run("install", &["-m", "0644", "-o", "root", "-g", "root", SSHD_DROPIN_DISABLED, SSHD_DROPIN])?;
+        // Never leave sshd with a configuration it cannot load.
+        if let Err(e) = run("sshd", &["-t"]) {
+            let _ = std::fs::remove_file(SSHD_DROPIN);
+            return Err(format!("sshd rejected the certificate drop-in, left disabled: {e}"));
+        }
+        std::fs::remove_file(SSHD_DROPIN_DISABLED).map_err(|e| e.to_string())?;
+        reload_sshd()?;
+        println!("certificate login restored");
+    }
+    if Path::new(HTTP_UNIT).exists() {
+        println!("HTTP endpoint stays stopped: start it with `systemctl enable --now vps-agent-http`");
     }
     println!("vps-agent is on");
     Ok(())

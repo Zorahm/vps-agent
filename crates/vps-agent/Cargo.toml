@@ -7,9 +7,13 @@ edition.workspace = true
 vps-agent-core = { path = "../vps-agent-core" }
 serde.workspace = true
 serde_json.workspace = true
-rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.5.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server"] }
+axum = "0.8"
+sha2 = "0.11"
+getrandom = "0.4"
+toml.workspace = true
 schemars = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "io-std", "time", "net"] }
 clap = { version = "4", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 base64 = "0.22"
