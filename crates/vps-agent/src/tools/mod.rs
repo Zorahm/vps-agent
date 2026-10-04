@@ -1,7 +1,11 @@
 pub mod exec;
 pub mod fs;
+pub mod host;
 pub mod image;
 pub mod jobs;
+pub mod screenshot;
+pub mod service;
+pub mod session;
 pub mod sysinfo;
 pub mod users;
 

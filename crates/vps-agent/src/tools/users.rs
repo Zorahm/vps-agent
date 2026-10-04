@@ -44,11 +44,11 @@ pub fn helper_args_delete(p: &UserDeleteParams) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
-async fn call_helper(ctx: &Ctx, tool: &str, args: Vec<String>) -> ToolResult {
+pub async fn call_helper(ctx: &Ctx, tool: &str, args: Vec<String>, stdin: Option<&[u8]>) -> ToolResult {
     let started = Instant::now();
     let mut argv = ctx.helper.clone();
     argv.extend(args.iter().cloned());
-    let out = run_capture(&argv, None).await?;
+    let out = run_capture(&argv, stdin).await?;
     audit(
         tool,
         AGENT_USER,
@@ -64,15 +64,15 @@ async fn call_helper(ctx: &Ctx, tool: &str, args: Vec<String>) -> ToolResult {
 }
 
 pub async fn user_create(ctx: &Ctx, p: UserCreateParams) -> ToolResult {
-    call_helper(ctx, "user_create", helper_args_create(&p)?).await
+    call_helper(ctx, "user_create", helper_args_create(&p)?, None).await
 }
 
 pub async fn user_delete(ctx: &Ctx, p: UserDeleteParams) -> ToolResult {
-    call_helper(ctx, "user_delete", helper_args_delete(&p)?).await
+    call_helper(ctx, "user_delete", helper_args_delete(&p)?, None).await
 }
 
 pub async fn user_list(ctx: &Ctx) -> ToolResult {
-    call_helper(ctx, "user_list", strings(&["user", "list"])).await
+    call_helper(ctx, "user_list", strings(&["user", "list"]), None).await
 }
 
 #[cfg(test)]
