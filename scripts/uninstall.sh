@@ -65,6 +65,11 @@ do_users() {
 }
 
 do_files() {
+  if [ -f /etc/ssh/sshd_config.d/50-vps-agent.conf ] || [ -f /etc/ssh/vps-agent_ca.pub ]; then
+    rm -f /etc/ssh/sshd_config.d/50-vps-agent.conf /etc/ssh/vps-agent_ca.pub
+    systemctl reload ssh 2>/dev/null || systemctl reload sshd || true
+  fi
+  rm -f /etc/systemd/system/vps-agent-http.service
   rm -f /etc/sudoers.d/vps-agent /usr/local/bin/vps-agent "$PRIV"
   rm -rf /etc/vps-agent /var/lib/vps-agent
   if [ "$USERS" != keep ] && [ -z "$(ls -A "$PRIV_DIR/archive" 2>/dev/null)" ]; then

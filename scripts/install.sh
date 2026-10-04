@@ -7,6 +7,8 @@ VERSION="latest"
 MODE="ask"
 PUBKEY=""
 FROM=""
+# Public key of a user CA. With it the agent logs in with short-lived certificates.
+CA_PUBKEY=""
 DRY_RUN=0
 YES=0
 REPO="zorahm/vps-agent"
@@ -17,6 +19,7 @@ TARGET=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --pubkey) PUBKEY="${2:?--pubkey needs a value}"; shift 2 ;;
+    --ca-pubkey) CA_PUBKEY="${2:?--ca-pubkey needs a value}"; shift 2 ;;
     --mode) MODE="${2:?--mode needs a value}"; shift 2 ;;
     --version) VERSION="${2:?--version needs a value}"; shift 2 ;;
     --from) FROM="${2:?--from needs a directory}"; shift 2 ;;
@@ -75,6 +78,11 @@ preflight() {
 }
 
 read_pubkey() {
+  if [ -n "$CA_PUBKEY" ]; then
+    [[ "$CA_PUBKEY" =~ $KEY_RE ]] || fail "--ca-pubkey does not look like an SSH public key"
+    # Certificate mode needs no static key; one given explicitly is still installed.
+    if [ -z "$PUBKEY" ]; then return; fi
+  fi
   if [ -z "$PUBKEY" ]; then
     if [ "$YES" = 1 ] || [ ! -r /dev/tty ]; then fail "--pubkey is required in non-interactive mode"; fi
     printf 'SSH public key for the agent: ' >/dev/tty
@@ -167,6 +175,29 @@ do_key() {
   chown agent:agent "$keys"
 }
 
+do_ca() {
+  local dropin=/etc/ssh/sshd_config.d/50-vps-agent.conf
+  if ! grep -Eq '^\s*Include\s+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+    echo "/etc/ssh/sshd_config does not include sshd_config.d; certificate mode cannot be set up" >&2
+    return 1
+  fi
+  printf '%s\n' "$CA_PUBKEY" >"$UI_TMP/ca.pub"
+  install -m 0644 -o root -g root "$UI_TMP/ca.pub" /etc/ssh/vps-agent_ca.pub
+  cat >"$UI_TMP/dropin" <<'EOF'
+# Managed by vps-agent. The agent user may log in with certificates signed by this CA.
+Match User agent
+    TrustedUserCAKeys /etc/ssh/vps-agent_ca.pub
+EOF
+  install -m 0644 -o root -g root "$UI_TMP/dropin" "$dropin"
+  rm -f /var/lib/vps-agent-priv/sshd-dropin.disabled
+  # A broken sshd configuration would lock everyone out at the next restart: test, or undo.
+  if ! sshd -t; then
+    rm -f "$dropin"
+    return 1
+  fi
+  systemctl reload ssh 2>/dev/null || systemctl reload sshd
+}
+
 do_selftest() {
   sudo -u agent -H /usr/local/bin/vps-agent selftest
 }
@@ -200,7 +231,8 @@ step
 run "sudoers rule validated and installed" do_sudoers
 
 step
-run "SSH key added" do_key
+if [ -n "$PUBKEY" ]; then run "SSH key added" do_key; fi
+if [ -n "$CA_PUBKEY" ]; then run "certificate login enabled for agent" do_ca; fi
 
 step
 run "selftest" do_selftest
