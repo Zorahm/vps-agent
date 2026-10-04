@@ -36,7 +36,7 @@ const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabiliti
 check("initialize", !!init.result?.serverInfo, JSON.stringify(init));
 child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 const tools = (await rpc("tools/list", {})).result.tools;
-check("tools/list returns 29 tools", tools.length === 29, tools.map((t) => t.name).join(","));
+check("tools/list returns 32 tools", tools.length === 32, tools.map((t) => t.name).join(","));
 
 let r = await call("exec", { cmd: "id -un" });
 check("exec as agent", !r.isError && /exit_code: 0/.test(r.text) && /<untrusted source="exec">\nagent\n<\/untrusted>/.test(r.text), r.text);
