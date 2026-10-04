@@ -11,3 +11,5 @@ pub const ARCHIVE_DIR: &str = "/var/lib/vps-agent-priv/archive";
 pub const SUDOERS_FILE: &str = "/etc/sudoers.d/vps-agent";
 pub const SUDOERS_DISABLED: &str = "/var/lib/vps-agent-priv/sudoers.disabled";
 pub const APPS_DIR: &str = "/srv/apps";
+pub const SSHD_DROPIN: &str = "/etc/ssh/sshd_config.d/50-vps-agent.conf";
+pub const SSHD_DROPIN_DISABLED: &str = "/var/lib/vps-agent-priv/sshd-dropin.disabled";

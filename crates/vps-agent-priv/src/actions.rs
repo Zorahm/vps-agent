@@ -3,6 +3,7 @@ use crate::sys::System;
 use serde_json::{json, Value};
 use std::path::Path;
 use vps_agent_core::names::{validate_group_name, validate_user_name};
+use vps_agent_core::nginx::{check_vhost, INCLUDE_FILE, INCLUDE_LINE, SITES_DIR};
 use vps_agent_core::paths::MANAGED_GROUP;
 use vps_agent_core::policy::Policy;
 use vps_agent_core::registry::{lock, Registry, UserEntry};
@@ -128,22 +129,79 @@ pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
             env.sys.run("usermod", &["-aG", group, user]).map_err(ActionError::System)?;
             Ok(json!({"ok": true}))
         }
+        Action::Linger { user, enable } => {
+            check_managed(env, &reg, user)?;
+            let verb = if *enable { "enable-linger" } else { "disable-linger" };
+            env.sys.run("loginctl", &[verb, user]).map_err(ActionError::System)?;
+            Ok(json!({"ok": true}))
+        }
+        Action::NginxApply { name, content } => {
+            let target = vhost_path(env, name)?;
+            let text = std::str::from_utf8(content)
+                .map_err(|_| ActionError::Denied("vhost is not valid UTF-8".into()))?;
+            check_vhost(text).map_err(ActionError::Denied)?;
+            env.sys
+                .run("install", &["-d", "-m", "0755", "-o", "root", "-g", "root", SITES_DIR])
+                .map_err(ActionError::System)?;
+            let created_include = !env.sys.path_exists(INCLUDE_FILE);
+            if created_include {
+                env.sys.write_file(INCLUDE_FILE, INCLUDE_LINE.as_bytes()).map_err(ActionError::System)?;
+            }
+            let previous = env.sys.read_file(&target);
+            env.sys.write_file(&target, content).map_err(ActionError::System)?;
+            if let Err(e) = env.sys.run("nginx", &["-t"]) {
+                // Put everything back exactly as it was; the running nginx was never touched.
+                let restored = match &previous {
+                    Some(old) => env.sys.write_file(&target, old),
+                    None => env.sys.remove_file(&target),
+                };
+                if created_include {
+                    let _ = env.sys.remove_file(INCLUDE_FILE);
+                }
+                restored.map_err(ActionError::System)?;
+                return denied(format!("nginx -t failed, rolled back: {e}"));
+            }
+            env.sys.run("systemctl", &["reload", "nginx"]).map_err(ActionError::System)?;
+            Ok(json!({"applied": target}))
+        }
+        Action::NginxRemove { name } => {
+            let target = vhost_path(env, name)?;
+            let Some(previous) = env.sys.read_file(&target) else {
+                return denied(format!("no such vhost: {name}"));
+            };
+            env.sys.remove_file(&target).map_err(ActionError::System)?;
+            if let Err(e) = env.sys.run("nginx", &["-t"]) {
+                env.sys.write_file(&target, &previous).map_err(ActionError::System)?;
+                return denied(format!("nginx -t failed after removal, rolled back: {e}"));
+            }
+            env.sys.run("systemctl", &["reload", "nginx"]).map_err(ActionError::System)?;
+            Ok(json!({"removed": target}))
+        }
     }
 }
 
+fn vhost_path(env: &Env, name: &str) -> Result<String, ActionError> {
+    validate_group_name(name).map_err(|e| ActionError::Denied(format!("vhost name {name:?}: {e}")))?;
+    if !env.sys.path_exists("/etc/nginx/nginx.conf") {
+        return denied("nginx is not installed on this server");
+    }
+    Ok(format!("{SITES_DIR}/{name}.conf"))
+}
+
 #[cfg(test)]
-mod tests {
+mod tests_support {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
     #[derive(Default)]
-    struct Fake {
-        uids: RefCell<HashMap<String, u32>>,
-        groups: RefCell<HashMap<String, Vec<String>>>,
-        existing_groups: Vec<String>,
-        calls: RefCell<Vec<String>>,
-        fail_on: Option<&'static str>,
+    pub struct Fake {
+        pub uids: RefCell<HashMap<String, u32>>,
+        pub groups: RefCell<HashMap<String, Vec<String>>>,
+        pub existing_groups: Vec<String>,
+        pub calls: RefCell<Vec<String>>,
+        pub fail_on: Option<&'static str>,
+        pub files: RefCell<HashMap<String, Vec<u8>>>,
     }
 
     impl System for Fake {
@@ -162,6 +220,20 @@ mod tests {
         fn now(&self) -> u64 {
             1_700_000_000
         }
+        fn path_exists(&self, path: &str) -> bool {
+            self.files.borrow().contains_key(path)
+        }
+        fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+            self.files.borrow().get(path).cloned()
+        }
+        fn write_file(&self, path: &str, data: &[u8]) -> Result<(), String> {
+            self.files.borrow_mut().insert(path.to_string(), data.to_vec());
+            Ok(())
+        }
+        fn remove_file(&self, path: &str) -> Result<(), String> {
+            self.files.borrow_mut().remove(path);
+            Ok(())
+        }
         fn run(&self, program: &str, args: &[&str]) -> Result<(), String> {
             self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
             if self.fail_on == Some(program) {
@@ -178,25 +250,31 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        dir: std::path::PathBuf,
-        policy: Policy,
+    pub struct Fixture {
+        pub dir: std::path::PathBuf,
+        pub policy: Policy,
     }
 
-    fn fixture(tag: &str) -> Fixture {
+    pub fn fixture(tag: &str) -> Fixture {
         let dir = std::env::temp_dir().join(format!("vps-priv-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Fixture { dir, policy: Policy::from_toml_str("").unwrap() }
     }
 
-    fn env<'a>(f: &'a Fixture, sys: &'a Fake, reg: &'a std::path::Path) -> Env<'a> {
+    pub fn env<'a>(f: &'a Fixture, sys: &'a Fake, reg: &'a std::path::Path) -> Env<'a> {
         Env { sys, policy: &f.policy, registry_path: reg, archive_dir: &f.dir, apps_dir: "/srv/apps" }
     }
 
-    fn create(e: &Env, name: &str) -> Result<serde_json::Value, ActionError> {
+    pub fn create(e: &Env, name: &str) -> Result<serde_json::Value, ActionError> {
         execute(e, &Action::UserCreate { name: name.into(), shell: Shell::Bash })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::*;
+    use super::*;
 
     #[test]
     fn create_allocates_uid_and_registers() {
@@ -311,5 +389,100 @@ mod tests {
         assert!(matches!(add("shop", "sudo"), Err(ActionError::Denied(_))));
         assert!(matches!(add("shop", "nosuchgroup"), Err(ActionError::Denied(_))));
         assert!(matches!(add("root", "www-data"), Err(ActionError::Denied(_))));
+    }
+}
+
+#[cfg(test)]
+mod v1_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    const VHOST: &[u8] = b"server { listen 8080; location / { proxy_pass http://127.0.0.1:3000; } }\n";
+    const TARGET: &str = "/etc/nginx/sites-agent/shop.conf";
+
+    fn with_nginx(sys: &Fake) {
+        sys.write_file("/etc/nginx/nginx.conf", b"http {}").unwrap();
+    }
+
+    fn apply(e: &Env, content: &[u8]) -> Result<serde_json::Value, ActionError> {
+        execute(e, &Action::NginxApply { name: "shop".into(), content: content.to_vec() })
+    }
+
+    #[test]
+    fn linger_only_for_managed_users() {
+        let f = fixture("linger");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        let e = env(&f, &sys, &reg);
+        create(&e, "shop").unwrap();
+        sys.calls.borrow_mut().clear();
+        assert!(execute(&e, &Action::Linger { user: "shop".into(), enable: true }).is_ok());
+        assert_eq!(sys.calls.borrow()[0], "loginctl enable-linger shop");
+        assert!(execute(&e, &Action::Linger { user: "shop".into(), enable: false }).is_ok());
+        assert_eq!(sys.calls.borrow()[1], "loginctl disable-linger shop");
+        let other = execute(&e, &Action::Linger { user: "root".into(), enable: true });
+        assert!(matches!(other, Err(ActionError::Denied(_))));
+    }
+
+    #[test]
+    fn nginx_apply_writes_tests_and_reloads() {
+        let f = fixture("ngx-ok");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        with_nginx(&sys);
+        apply(&env(&f, &sys, &reg), VHOST).unwrap();
+        assert_eq!(sys.read_file(TARGET).unwrap(), VHOST);
+        assert!(sys.path_exists("/etc/nginx/conf.d/vps-agent.conf"));
+        let calls = sys.calls.borrow().clone();
+        let test = calls.iter().position(|c| c == "nginx -t").unwrap();
+        let reload = calls.iter().position(|c| c == "systemctl reload nginx").unwrap();
+        assert!(test < reload);
+    }
+
+    #[test]
+    fn nginx_apply_rolls_back_when_the_config_test_fails() {
+        let f = fixture("ngx-bad");
+        let reg = f.dir.join("users.json");
+        let sys = Fake { fail_on: Some("nginx"), ..Default::default() };
+        with_nginx(&sys);
+        sys.write_file(TARGET, b"old").unwrap();
+        let r = apply(&env(&f, &sys, &reg), VHOST);
+        assert!(matches!(r, Err(ActionError::Denied(_))));
+        assert_eq!(sys.read_file(TARGET).unwrap(), b"old");
+        assert!(!sys.calls.borrow().iter().any(|c| c.starts_with("systemctl reload")));
+
+        // A brand-new file is removed again, not left behind.
+        sys.remove_file(TARGET).unwrap();
+        assert!(apply(&env(&f, &sys, &reg), VHOST).is_err());
+        assert!(!sys.path_exists(TARGET));
+    }
+
+    #[test]
+    fn nginx_apply_rejects_dangerous_config_bad_names_and_missing_nginx() {
+        let f = fixture("ngx-deny");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        let e = env(&f, &sys, &reg);
+        assert!(matches!(apply(&e, VHOST), Err(ActionError::Denied(_)))); // nginx not installed
+        with_nginx(&sys);
+        assert!(matches!(apply(&e, b"server { access_log /etc/cron.d/x; }"), Err(ActionError::Denied(_))));
+        assert!(matches!(apply(&e, &[0xff, 0xfe]), Err(ActionError::Denied(_))));
+        let bad_name = execute(&e, &Action::NginxApply { name: "../x".into(), content: VHOST.to_vec() });
+        assert!(matches!(bad_name, Err(ActionError::Denied(_))));
+        assert!(!sys.calls.borrow().iter().any(|c| c.starts_with("nginx")));
+    }
+
+    #[test]
+    fn nginx_remove_deletes_and_reloads() {
+        let f = fixture("ngx-rm");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        with_nginx(&sys);
+        let e = env(&f, &sys, &reg);
+        apply(&e, VHOST).unwrap();
+        execute(&e, &Action::NginxRemove { name: "shop".into() }).unwrap();
+        assert!(!sys.path_exists(TARGET));
+        let missing = execute(&e, &Action::NginxRemove { name: "shop".into() });
+        assert!(matches!(missing, Err(ActionError::Denied(_))));
     }
 }

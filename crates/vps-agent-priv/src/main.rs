@@ -32,10 +32,18 @@ fn main() -> ExitCode {
         eprintln!("vps-agent-priv: must run as root (through sudo)");
         return ExitCode::from(4);
     }
-    let action = match cli::parse(&args) {
+    let mut action = match cli::parse(&args) {
         Ok(a) => a,
         Err(usage) => return fail(2, &args, &usage),
     };
+    if let cli::Action::NginxApply { content, .. } = &mut action {
+        use std::io::Read;
+        // One byte over the limit is enough for check_vhost to refuse an oversized file.
+        let limit = vps_agent_core::nginx::MAX_VHOST_BYTES as u64 + 1;
+        if let Err(e) = std::io::stdin().take(limit).read_to_end(content) {
+            return fail(4, &args, &format!("cannot read the vhost from stdin: {e}"));
+        }
+    }
     let policy = match Policy::load(POLICY_FILE) {
         Ok(p) => p,
         Err(e) => return fail(4, &args, &e),

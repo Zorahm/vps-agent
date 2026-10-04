@@ -7,6 +7,10 @@ pub trait System {
     fn group_exists(&self, group: &str) -> bool;
     fn run(&self, program: &str, args: &[&str]) -> Result<(), String>;
     fn now(&self) -> u64;
+    fn path_exists(&self, path: &str) -> bool;
+    fn read_file(&self, path: &str) -> Option<Vec<u8>>;
+    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), String>;
+    fn remove_file(&self, path: &str) -> Result<(), String>;
 }
 
 pub struct RealSystem;
@@ -75,5 +79,21 @@ impl System for RealSystem {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    fn path_exists(&self, path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+
+    fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(path).ok()
+    }
+
+    fn write_file(&self, path: &str, data: &[u8]) -> Result<(), String> {
+        std::fs::write(path, data).map_err(|e| format!("{path}: {e}"))
+    }
+
+    fn remove_file(&self, path: &str) -> Result<(), String> {
+        std::fs::remove_file(path).map_err(|e| format!("{path}: {e}"))
     }
 }
