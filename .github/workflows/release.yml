@@ -1,0 +1,69 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --workspace
+      # .cargo/config.toml links both musl targets with rust-lld, so no cross toolchain is needed.
+      - run: cargo build --release --target ${{ matrix.target }} -p vps-agent -p vps-agent-priv
+      - run: tar -czf vps-agent-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release vps-agent vps-agent-priv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: vps-agent-${{ matrix.target }}.tar.gz
+
+  mux:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64, exe: vps-agent-mux }
+          - { os: macos-latest, name: macos-aarch64, exe: vps-agent-mux }
+          - { os: windows-latest, name: windows-x86_64, exe: vps-agent-mux.exe }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p vps-agent-mux
+      - shell: bash
+        run: |
+          mkdir out
+          cp "target/release/${{ matrix.exe }}" "out/vps-agent-mux-${{ matrix.name }}${{ runner.os == 'Windows' && '.exe' || '' }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mux-${{ matrix.name }}
+          path: out/*
+
+  publish:
+    needs: [server, mux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck -x scripts/*.sh scripts/lib/ui.sh plugin/hooks/guard.sh
+          bash scripts/bundle.sh
+          shellcheck dist/install.sh dist/uninstall.sh
+          cp dist/install.sh dist/uninstall.sh scripts/connect.sh artifacts/
+          cd artifacts && sha256sum -- * > SHA256SUMS
+      - run: gh release create "$GITHUB_REF_NAME" artifacts/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
