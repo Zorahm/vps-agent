@@ -1,0 +1,9 @@
+[package]
+name = "vps-agent-priv"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vps-agent-core = { path = "../vps-agent-core" }
+serde.workspace = true
+serde_json.workspace = true
