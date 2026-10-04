@@ -1,0 +1,13 @@
+pub const AGENT_USER: &str = "agent";
+pub const MANAGED_GROUP: &str = "agent-managed";
+pub const HELPER_BIN: &str = "/usr/local/libexec/vps-agent-priv";
+pub const POLICY_FILE: &str = "/etc/vps-agent/policy.toml";
+pub const STATE_DIR: &str = "/var/lib/vps-agent";
+pub const LOG_DIR: &str = "/var/lib/vps-agent/logs";
+pub const JOB_DIR: &str = "/var/lib/vps-agent/jobs";
+pub const PRIV_DIR: &str = "/var/lib/vps-agent-priv";
+pub const REGISTRY_FILE: &str = "/var/lib/vps-agent-priv/users.json";
+pub const ARCHIVE_DIR: &str = "/var/lib/vps-agent-priv/archive";
+pub const SUDOERS_FILE: &str = "/etc/sudoers.d/vps-agent";
+pub const SUDOERS_DISABLED: &str = "/var/lib/vps-agent-priv/sudoers.disabled";
+pub const APPS_DIR: &str = "/srv/apps";
