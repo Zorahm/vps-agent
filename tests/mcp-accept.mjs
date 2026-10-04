@@ -36,7 +36,7 @@ const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabiliti
 check("initialize", !!init.result?.serverInfo, JSON.stringify(init));
 child.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
 const tools = (await rpc("tools/list", {})).result.tools;
-check("tools/list returns 15 tools", tools.length === 15, tools.map((t) => t.name).join(","));
+check("tools/list returns 26 tools", tools.length === 26, tools.map((t) => t.name).join(","));
 
 let r = await call("exec", { cmd: "id -un" });
 check("exec as agent", !r.isError && /exit_code: 0/.test(r.text) && /<untrusted source="exec">\nagent\n<\/untrusted>/.test(r.text), r.text);
@@ -150,6 +150,95 @@ check("view_image rejects a non-image", r.isError, r.text);
 
 r = await call("sysinfo");
 check("sysinfo has five sections", ["load", "memory", "disks", "failed units", "listening ports"].every((s) => r.text.includes(`## ${s}`)), r.text);
+
+// ---- v1: sessions, user services, lingering, screenshot, nginx guard ----
+r = await call("session_open", { name: "t1", as_user: "acc-a" });
+check("session_open", !r.isError && /name: t1/.test(r.text), r.text);
+r = await call("session_open", { name: "t1", as_user: "acc-a" });
+check("duplicate session refused", r.isError, r.text);
+r = await call("session_send_keys", { name: "t1", text: "echo hi-$((6*7)); id -un", as_user: "acc-a" });
+check("session_send_keys", !r.isError, r.text);
+await sleep(800);
+r = await call("session_capture", { name: "t1", as_user: "acc-a" });
+check("session_capture shows the output", /hi-42/.test(r.text) && /\nacc-a\n/.test(r.text), r.text);
+r = await call("session_send_keys", { name: "t1", text: "sleep 300", as_user: "acc-a" });
+r = await call("session_send_keys", { name: "t1", keys: ["C-c"], as_user: "acc-a" });
+await sleep(500);
+r = await call("session_capture", { name: "t1", scrollback: 50, as_user: "acc-a" });
+check("C-c interrupts the running command", /\^C/.test(r.text), r.text);
+r = await call("session_send_keys", { name: "t1", keys: ["Enter;id"], as_user: "acc-a" });
+check("unknown key refused", r.isError, r.text);
+r = await call("session_capture", { name: "t1" });
+check("session is invisible to another user", r.isError, r.text);
+r = await call("session_close", { name: "t1", as_user: "acc-a" });
+check("session_close", !r.isError, r.text);
+r = await call("session_capture", { name: "t1", as_user: "acc-a" });
+check("closed session is gone", r.isError, r.text);
+r = await call("session_open", { name: "a:b" });
+check("bad session name refused", r.isError, r.text);
+
+r = await call("user_linger", { name: "acc-a", enable: true });
+check("user_linger enable", !r.isError, r.text);
+r = await call("user_linger", { name: "root", enable: true });
+check("user_linger root refused", r.isError, r.text);
+await sleep(2500);
+await call("exec", { cmd: "mkdir -p ~/.config/systemd/user", as_user: "acc-a" });
+r = await call("fs_write", {
+  path: "/srv/apps/acc-a/.config/systemd/user/acc-test.service",
+  content: "[Unit]\nDescription=vps-agent acceptance\n\n[Service]\nExecStart=/bin/sh -c 'echo started-ok; exec sleep 300'\n",
+  as_user: "acc-a",
+});
+check("unit file written", !r.isError, r.text);
+r = await call("service_control", { action: "daemon-reload", as_user: "acc-a" });
+check("service_control daemon-reload", /exit_code: 0/.test(r.text), r.text);
+r = await call("service_control", { action: "start", unit: "acc-test.service", as_user: "acc-a" });
+check("service_control start", /exit_code: 0/.test(r.text), r.text);
+await sleep(1000);
+r = await call("service_status", { unit: "acc-test.service", as_user: "acc-a" });
+check("service_status shows it running", /active \(running\)/.test(r.text), r.text);
+r = await call("service_logs", { unit: "acc-test.service", as_user: "acc-a" });
+check("service_logs has the unit's output", /started-ok/.test(r.text), r.text);
+r = await call("service_control", { action: "stop", unit: "acc-test.service", as_user: "acc-a" });
+check("service_control stop", /exit_code: 0/.test(r.text), r.text);
+r = await call("service_status", { unit: "acc-test.service", as_user: "acc-a" });
+check("stopped unit reports exit 3", /exit_code: 3/.test(r.text), r.text);
+r = await call("service_control", { action: "poweroff", as_user: "acc-a" });
+check("unknown service action refused", r.isError, r.text);
+r = await call("user_linger", { name: "acc-a", enable: false });
+check("user_linger disable", !r.isError, r.text);
+
+r = await call("screenshot", { url: "file:///etc/passwd" });
+check("screenshot refuses non-http URLs", r.isError && /http/.test(r.text), r.text);
+r = await call("exec", { cmd: "command -v chromium chromium-browser google-chrome | head -n 1" });
+if (/\/\S*chrom/.test(r.text)) {
+  r = await call("screenshot", { url: "http://127.0.0.1/", width: 800, height: 600 });
+  check("screenshot returns an image", !r.isError && r.content.some((c) => c.type === "image"), r.text);
+} else {
+  r = await call("screenshot", { url: "http://127.0.0.1/" });
+  check("screenshot explains that Chromium is missing", r.isError && /Chromium/.test(r.text), r.text);
+}
+
+r = await call("nginx_apply", { name: "acc", content: "server { listen 127.0.0.1:18999; access_log /etc/cron.d/pwn; }" });
+check("nginx_apply refuses a root-writing log path", r.isError && /not allowed/.test(r.text), r.text);
+r = await call("nginx_apply", { name: "../x", content: "server { listen 127.0.0.1:18999; }" });
+check("nginx_apply refuses a path as name", r.isError, r.text);
+r = await call("nginx_remove", { name: "no-such-vhost" });
+check("nginx_remove of a missing vhost fails cleanly", r.isError, r.text);
+if (process.env.ACCEPT_NGINX === "1") {
+  r = await call("nginx_apply", { name: "acc", content: "server { listen 127.0.0.1:18999; location / { return 200 'vps-agent-ok'; } }\n" });
+  check("nginx_apply installs and reloads", !r.isError, r.text);
+  await sleep(500);
+  r = await call("exec", { cmd: "curl -s http://127.0.0.1:18999/" });
+  check("the vhost answers", /vps-agent-ok/.test(r.text), r.text);
+  r = await call("nginx_apply", { name: "acc", content: "server { listen 127.0.0.1:18999; bogus_directive on; }\n" });
+  check("a broken vhost is rolled back", r.isError && /rolled back/.test(r.text), r.text);
+  r = await call("exec", { cmd: "curl -s http://127.0.0.1:18999/" });
+  check("the previous vhost still answers", /vps-agent-ok/.test(r.text), r.text);
+  r = await call("nginx_remove", { name: "acc" });
+  check("nginx_remove", !r.isError, r.text);
+} else {
+  console.log("SKIP  live nginx apply/rollback/remove (set ACCEPT_NGINX=1 to run it)");
+}
 
 r = await call("user_create", { name: "root" });
 check("user_create root refused", r.isError, r.text);
