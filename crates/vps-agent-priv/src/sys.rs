@@ -11,6 +11,8 @@ pub trait System {
     fn read_file(&self, path: &str) -> Option<Vec<u8>>;
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), String>;
     fn remove_file(&self, path: &str) -> Result<(), String>;
+    /// Runs a command and returns its exit code with stdout and stderr combined.
+    fn capture(&self, program: &str, args: &[&str]) -> Result<(i32, String), String>;
 }
 
 pub struct RealSystem;
@@ -95,5 +97,18 @@ impl System for RealSystem {
 
     fn remove_file(&self, path: &str) -> Result<(), String> {
         std::fs::remove_file(path).map_err(|e| format!("{path}: {e}"))
+    }
+
+    fn capture(&self, program: &str, args: &[&str]) -> Result<(i32, String), String> {
+        let out = Command::new(program)
+            .args(args)
+            .env_clear()
+            .env("PATH", SAFE_PATH)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("{program}: {e}"))?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.code().unwrap_or(-1), text))
     }
 }

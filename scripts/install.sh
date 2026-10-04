@@ -147,6 +147,10 @@ groups   = []
 
 [redact]
 patterns = ['(?i)(password|secret|token|api[_-]?key)\s*[=:]\s*\S+', '-----BEGIN [A-Z ]*PRIVATE KEY-----']
+
+# System services the agent may start, stop, restart and read logs of, by exact unit name.
+[services]
+allow = []
 EOF
   sed -i "s/__MODE__/$MODE/" "$UI_TMP/policy.toml"
   install -m 0644 -o root -g root "$UI_TMP/policy.toml" /etc/vps-agent/policy.toml

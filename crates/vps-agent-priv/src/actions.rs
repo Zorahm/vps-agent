@@ -164,6 +164,26 @@ pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
             env.sys.run("systemctl", &["reload", "nginx"]).map_err(ActionError::System)?;
             Ok(json!({"applied": target}))
         }
+        Action::Service { verb, unit } => {
+            check_service(env, unit)?;
+            let args: Vec<&str> = if verb == "status" {
+                vec!["status", "--no-pager", "-l", unit]
+            } else {
+                vec![verb, unit]
+            };
+            // A failed start or an inactive unit is an answer for the caller, not a helper error.
+            let (code, output) = env.sys.capture("systemctl", &args).map_err(ActionError::System)?;
+            Ok(json!({"exit_code": code, "output": output}))
+        }
+        Action::ServiceLogs { unit, lines } => {
+            check_service(env, unit)?;
+            let n = lines.to_string();
+            let (code, output) = env
+                .sys
+                .capture("journalctl", &["-u", unit, "-n", &n, "--no-pager", "-o", "short-iso"])
+                .map_err(ActionError::System)?;
+            Ok(json!({"exit_code": code, "output": output}))
+        }
         Action::NginxRemove { name } => {
             let target = vhost_path(env, name)?;
             let Some(previous) = env.sys.read_file(&target) else {
@@ -177,6 +197,14 @@ pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
             env.sys.run("systemctl", &["reload", "nginx"]).map_err(ActionError::System)?;
             Ok(json!({"removed": target}))
         }
+    }
+}
+
+fn check_service(env: &Env, unit: &str) -> Result<(), ActionError> {
+    if env.policy.service_allowed(unit) {
+        Ok(())
+    } else {
+        denied(format!("{unit:?} is not in [services] allow of policy.toml"))
     }
 }
 
@@ -233,6 +261,10 @@ mod tests_support {
         fn remove_file(&self, path: &str) -> Result<(), String> {
             self.files.borrow_mut().remove(path);
             Ok(())
+        }
+        fn capture(&self, program: &str, args: &[&str]) -> Result<(i32, String), String> {
+            self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
+            Ok((0, "captured".into()))
         }
         fn run(&self, program: &str, args: &[&str]) -> Result<(), String> {
             self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
@@ -470,6 +502,37 @@ mod v1_tests {
         let bad_name = execute(&e, &Action::NginxApply { name: "../x".into(), content: VHOST.to_vec() });
         assert!(matches!(bad_name, Err(ActionError::Denied(_))));
         assert!(!sys.calls.borrow().iter().any(|c| c.starts_with("nginx")));
+    }
+
+    #[test]
+    fn system_services_are_limited_to_the_allow_list() {
+        let mut f = fixture("svc");
+        f.policy = Policy::from_toml_str("[services]\nallow = ['bot.service']").unwrap();
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        let e = env(&f, &sys, &reg);
+        let svc = |verb: &str, unit: &str| execute(&e, &Action::Service { verb: verb.into(), unit: unit.into() });
+
+        let v = svc("restart", "bot.service").unwrap();
+        assert_eq!(v["exit_code"], 0);
+        svc("status", "bot.service").unwrap();
+        execute(&e, &Action::ServiceLogs { unit: "bot.service".into(), lines: 20 }).unwrap();
+        assert_eq!(
+            *sys.calls.borrow(),
+            [
+                "systemctl restart bot.service",
+                "systemctl status --no-pager -l bot.service",
+                "journalctl -u bot.service -n 20 --no-pager -o short-iso",
+            ]
+        );
+
+        sys.calls.borrow_mut().clear();
+        for unit in ["ssh.service", "nginx.service", "bot", "--now", "bot.service --now"] {
+            assert!(matches!(svc("restart", unit), Err(ActionError::Denied(_))), "{unit}");
+        }
+        let logs = execute(&e, &Action::ServiceLogs { unit: "ssh.service".into(), lines: 20 });
+        assert!(matches!(logs, Err(ActionError::Denied(_))));
+        assert!(sys.calls.borrow().is_empty());
     }
 
     #[test]

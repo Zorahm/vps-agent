@@ -7,6 +7,7 @@ pub mod screenshot;
 pub mod service;
 pub mod session;
 pub mod sysinfo;
+pub mod system_service;
 pub mod users;
 
 use std::process::Stdio;

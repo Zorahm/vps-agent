@@ -24,6 +24,13 @@ pub struct Redact {
     pub patterns: Vec<String>,
 }
 
+/// System services (not `systemctl --user`) the agent may control through the helper.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct Services {
+    pub allow: Vec<String>,
+}
+
 fn default_uid_range() -> (u32, u32) {
     (20000, 29999)
 }
@@ -35,6 +42,7 @@ pub struct Policy {
     pub uid_range: (u32, u32),
     pub deny: Deny,
     pub redact: Redact,
+    pub services: Services,
 }
 
 impl Default for Policy {
@@ -44,6 +52,7 @@ impl Default for Policy {
             uid_range: default_uid_range(),
             deny: Deny::default(),
             redact: Redact::default(),
+            services: Services::default(),
         }
     }
 }
@@ -84,6 +93,18 @@ impl Policy {
     pub fn group_denied(&self, group: &str) -> bool {
         BUILTIN_DENY_GROUPS.contains(&group) || self.deny.groups.iter().any(|g| g == group)
     }
+
+    /// True for a well-formed `.service` unit that the administrator listed by exact name.
+    pub fn service_allowed(&self, unit: &str) -> bool {
+        valid_service_unit(unit) && self.services.allow.iter().any(|u| u == unit)
+    }
+}
+
+pub fn valid_service_unit(unit: &str) -> bool {
+    unit.len() <= 128
+        && unit.strip_suffix(".service").is_some_and(|stem| !stem.is_empty())
+        && !unit.starts_with('-')
+        && unit.bytes().all(|b| b.is_ascii_alphanumeric() || b"@._-".contains(&b))
 }
 
 pub fn normalize_lexical(path: &str) -> Result<String, String> {
@@ -228,6 +249,17 @@ mod tests {
         assert!(out.contains("[REDACTED]"));
         assert!(out.contains("plain line"));
         assert!(c.redact("-----BEGIN OPENSSH PRIVATE KEY-----").contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn only_listed_service_units_are_allowed() {
+        let p = Policy::from_toml_str("[services]
+allow = ['bot.service', '../evil.service', 'nginx']").unwrap();
+        assert!(p.service_allowed("bot.service"));
+        for no in ["nginx.service", "bot", "nginx", "../evil.service", "bot.service extra", "--now", ""] {
+            assert!(!p.service_allowed(no), "{no:?}");
+        }
+        assert!(!Policy::from_toml_str("").unwrap().service_allowed("bot.service"));
     }
 
     #[test]
