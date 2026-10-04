@@ -1,0 +1,8 @@
+{
+  "name": "vps-agent",
+  "description": "Rootless, policy-checked access to your VPS hosts: commands, long jobs, interactive sessions, files, screenshots, user services and nginx vhosts.",
+  "version": "0.1.0",
+  "author": { "name": "ZorahM" },
+  "repository": "https://github.com/zorahm/vps-agent",
+  "license": "MIT"
+}

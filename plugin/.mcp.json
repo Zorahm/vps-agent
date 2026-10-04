@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "vps-agent": {
+      "command": "vps-agent-mux",
+      "args": ["serve"]
+    }
+  }
+}
