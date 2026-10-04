@@ -311,6 +311,39 @@ impl Server {
         to_mcp(tools::system_service::system_service_control(&self.ctx, p).await)
     }
 
+    #[tool(
+        description = "Install apt packages as root. Only names the administrator listed under [packages] allow in policy.toml are accepted; there is no way to remove packages. Can take minutes.",
+        annotations(destructive_hint = true)
+    )]
+    async fn pkg_install(&self, Parameters(p): Parameters<tools::provision::PkgInstallParams>) -> McpResult {
+        if let Err(e) = self.destructive() {
+            return to_mcp(Err(e));
+        }
+        to_mcp(tools::provision::pkg_install(&self.ctx, p).await)
+    }
+
+    #[tool(
+        description = "Get a Let's Encrypt certificate for a domain with certbot (needs nginx and a DNS record already pointing here). Only domains listed under [certs] domains in policy.toml are accepted, and attempts are limited per day because failures count against Let's Encrypt rate limits. Returns cert_dir for use in nginx_apply.",
+        annotations(destructive_hint = true)
+    )]
+    async fn cert_issue(&self, Parameters(p): Parameters<tools::provision::CertIssueParams>) -> McpResult {
+        if let Err(e) = self.destructive() {
+            return to_mcp(Err(e));
+        }
+        to_mcp(tools::provision::cert_issue(&self.ctx, p).await)
+    }
+
+    #[tool(
+        description = "Create a PostgreSQL database owned by a managed user. By default the user connects through the Unix socket with peer authentication and no password exists: use the returned url. With password=true a random password is written to a file in the user's home and only the file path is returned; do not read that file, point the app at it.",
+        annotations(destructive_hint = true)
+    )]
+    async fn db_create(&self, Parameters(p): Parameters<tools::provision::DbCreateParams>) -> McpResult {
+        if let Err(e) = self.destructive() {
+            return to_mcp(Err(e));
+        }
+        to_mcp(tools::provision::db_create(&self.ctx, p).await)
+    }
+
     #[tool(description = "Remove an nginx vhost installed with nginx_apply and reload nginx.", annotations(destructive_hint = true))]
     async fn nginx_remove(&self, Parameters(p): Parameters<tools::host::NginxRemoveParams>) -> McpResult {
         if let Err(e) = self.destructive() {
@@ -367,6 +400,7 @@ mod tests {
             "exec", "job_start", "job_kill", "fs_edit", "fs_write", "fs_upload", "user_create",
             "user_delete", "session_open", "session_send_keys", "session_close", "service_control",
             "user_linger", "nginx_apply", "nginx_remove", "system_service_control",
+            "pkg_install", "cert_issue", "db_create",
         ];
         assert_eq!(tools.len(), read_only.len() + destructive.len());
         for n in read_only {

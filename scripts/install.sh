@@ -146,11 +146,28 @@ paths    = ["/etc/shadow", "/root", "/etc/vps-agent"]
 groups   = []
 
 [redact]
-patterns = ['(?i)(password|secret|token|api[_-]?key)\s*[=:]\s*\S+', '-----BEGIN [A-Z ]*PRIVATE KEY-----']
+patterns = ['(?i)(password|secret|token|api[_-]?key)\s*[=:]\s*\S+', '-----BEGIN [A-Z ]*PRIVATE KEY-----', '://[^/\s:@]+:[^/\s@]+@']
 
 # System services the agent may start, stop, restart and read logs of, by exact unit name.
 [services]
 allow = []
+
+# apt packages the agent may install, by exact name. Package scripts run as root and
+# dependencies are pulled in automatically: list only what you would install yourself.
+[packages]
+allow = []
+
+# Let's Encrypt certificates. Disabled until email, agree_tos and domains are all set.
+# A domain is an exact name or "*.example.com" for any name under example.com.
+[certs]
+email = ""
+agree_tos = false
+domains = []
+max_per_day = 5
+
+# PostgreSQL roles and databases for managed users (peer authentication by default).
+[databases]
+postgres = false
 EOF
   sed -i "s/__MODE__/$MODE/" "$UI_TMP/policy.toml"
   install -m 0644 -o root -g root "$UI_TMP/policy.toml" /etc/vps-agent/policy.toml

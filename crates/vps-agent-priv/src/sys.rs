@@ -13,6 +13,11 @@ pub trait System {
     fn remove_file(&self, path: &str) -> Result<(), String>;
     /// Runs a command and returns its exit code with stdout and stderr combined.
     fn capture(&self, program: &str, args: &[&str]) -> Result<(i32, String), String>;
+    /// Like `capture`, feeding `input` on stdin. Secrets go this way, never through arguments.
+    fn capture_input(&self, program: &str, args: &[&str], input: &[u8]) -> Result<(i32, String), String>;
+    fn home_of(&self, user: &str) -> Option<String>;
+    /// 48 hex characters from the kernel's random source.
+    fn random_hex(&self) -> Result<String, String>;
 }
 
 pub struct RealSystem;
@@ -104,11 +109,48 @@ impl System for RealSystem {
             .args(args)
             .env_clear()
             .env("PATH", SAFE_PATH)
+            // apt and its package scripts must never stop to ask a question.
+            .env("DEBIAN_FRONTEND", "noninteractive")
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("{program}: {e}"))?;
         let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
         text.push_str(&String::from_utf8_lossy(&out.stderr));
         Ok((out.status.code().unwrap_or(-1), text))
+    }
+
+    fn capture_input(&self, program: &str, args: &[&str], input: &[u8]) -> Result<(i32, String), String> {
+        use std::io::Write;
+        let mut child = Command::new(program)
+            .args(args)
+            .env_clear()
+            .env("PATH", SAFE_PATH)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{program}: {e}"))?;
+        // Inputs here are a line or two, far below a pipe buffer, so writing first cannot block.
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(input);
+        }
+        let out = child.wait_with_output().map_err(|e| format!("{program}: {e}"))?;
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.code().unwrap_or(-1), text))
+    }
+
+    fn home_of(&self, user: &str) -> Option<String> {
+        let passwd = output("getent", &["passwd", user])?;
+        passwd.split(':').nth(5).filter(|h| h.starts_with('/')).map(String::from)
+    }
+
+    fn random_hex(&self) -> Result<String, String> {
+        use std::io::Read;
+        let mut buf = [0u8; 24];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .map_err(|e| format!("/dev/urandom: {e}"))?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 }

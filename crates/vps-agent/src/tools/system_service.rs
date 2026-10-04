@@ -51,7 +51,8 @@ pub fn helper_args(verb: &str, unit: &str, lines: Option<u32>) -> Result<Vec<Str
     }
 }
 
-async fn call(ctx: &Ctx, tool: &str, args: Vec<String>) -> ToolResult {
+/// Runs a helper action that reports `{exit_code, output}` and formats it for the model.
+pub async fn call(ctx: &Ctx, tool: &str, args: Vec<String>) -> ToolResult {
     let started = Instant::now();
     let mut argv = ctx.helper.clone();
     argv.extend(args.iter().cloned());

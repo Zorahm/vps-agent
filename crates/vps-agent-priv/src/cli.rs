@@ -18,11 +18,17 @@ pub enum Action {
     /// A system service from the policy's allow list.
     Service { verb: String, unit: String },
     ServiceLogs { unit: String, lines: u32 },
+    PkgUpdate,
+    PkgInstall { names: Vec<String> },
+    CertIssue { domain: String },
+    /// A PostgreSQL role named after the managed user plus a database it owns.
+    DbCreate { user: String, name: String, password: bool },
 }
 
 pub const USAGE: &str = "usage: vps-agent-priv user create <name> [--shell bash|nologin] | \
 user delete <name> [--archive] | user list | user check <name> | group add <user> <group> | linger enable|disable <user> | \nnginx apply <name> (vhost on stdin) | nginx remove <name> | \
-service start|stop|restart|reload|status <unit> | service logs <unit> [lines]";
+service start|stop|restart|reload|status <unit> | service logs <unit> [lines] | \
+pkg update | pkg install <name>... | cert issue <domain> | db create <user> <database> [--password]";
 
 pub fn parse(args: &[String]) -> Result<Action, String> {
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -50,6 +56,17 @@ pub fn parse(args: &[String]) -> Result<Action, String> {
         ["nginx", "remove", name] => Ok(Action::NginxRemove { name: name.to_string() }),
         ["service", verb @ ("start" | "stop" | "restart" | "reload" | "status"), unit] => {
             Ok(Action::Service { verb: verb.to_string(), unit: unit.to_string() })
+        }
+        ["pkg", "update"] => Ok(Action::PkgUpdate),
+        ["pkg", "install", names @ ..] if (1..=20).contains(&names.len()) => {
+            Ok(Action::PkgInstall { names: names.iter().map(|n| n.to_string()).collect() })
+        }
+        ["cert", "issue", domain] => Ok(Action::CertIssue { domain: domain.to_string() }),
+        ["db", "create", user, name] => {
+            Ok(Action::DbCreate { user: user.to_string(), name: name.to_string(), password: false })
+        }
+        ["db", "create", user, name, "--password"] => {
+            Ok(Action::DbCreate { user: user.to_string(), name: name.to_string(), password: true })
         }
         ["service", "logs", unit] => Ok(Action::ServiceLogs { unit: unit.to_string(), lines: 100 }),
         ["service", "logs", unit, lines] => match lines.parse::<u32>() {
@@ -86,6 +103,16 @@ mod tests {
         assert!(matches!(p("linger disable shop"), Ok(Action::Linger { enable: false, .. })));
         assert!(matches!(p("nginx apply shop"), Ok(Action::NginxApply { .. })));
         assert!(matches!(p("nginx remove shop"), Ok(Action::NginxRemove { .. })));
+        assert!(matches!(p("pkg update"), Ok(Action::PkgUpdate)));
+        assert!(matches!(p("pkg install tmux git"), Ok(Action::PkgInstall { names }) if names == ["tmux", "git"]));
+        assert!(matches!(p("cert issue a.example.com"), Ok(Action::CertIssue { .. })));
+        assert!(matches!(p("db create shop shop_prod"), Ok(Action::DbCreate { password: false, .. })));
+        assert!(matches!(p("db create shop shop_prod --password"), Ok(Action::DbCreate { password: true, .. })));
+        for bad in ["pkg install", "pkg remove tmux", "pkg update now", "cert issue", "cert issue a b",
+                    "cert renew a.example.com", "db create shop", "db drop shop x",
+                    "db create shop x --superuser"] {
+            assert!(p(bad).is_err(), "{bad:?}");
+        }
         assert!(matches!(p("service restart bot.service"), Ok(Action::Service { .. })));
         assert!(matches!(p("service status bot.service"), Ok(Action::Service { .. })));
         assert!(matches!(p("service logs bot.service"), Ok(Action::ServiceLogs { lines: 100, .. })));

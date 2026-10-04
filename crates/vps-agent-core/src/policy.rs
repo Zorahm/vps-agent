@@ -31,6 +31,39 @@ pub struct Services {
     pub allow: Vec<String>,
 }
 
+/// apt packages the agent may install through the helper, by exact name.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct Packages {
+    pub allow: Vec<String>,
+}
+
+/// Let's Encrypt certificates. Off until the administrator gives an email, accepts the
+/// terms of service and lists the domains.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct Certs {
+    pub email: String,
+    pub agree_tos: bool,
+    /// Exact names, or `*.example.com` for any name under example.com.
+    pub domains: Vec<String>,
+    /// Failed attempts count too: they are what exhausts Let's Encrypt rate limits.
+    pub max_per_day: u32,
+}
+
+impl Default for Certs {
+    fn default() -> Self {
+        Certs { email: String::new(), agree_tos: false, domains: Vec::new(), max_per_day: 5 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct Databases {
+    /// Allow creating PostgreSQL roles and databases for managed users.
+    pub postgres: bool,
+}
+
 fn default_uid_range() -> (u32, u32) {
     (20000, 29999)
 }
@@ -43,6 +76,9 @@ pub struct Policy {
     pub deny: Deny,
     pub redact: Redact,
     pub services: Services,
+    pub packages: Packages,
+    pub certs: Certs,
+    pub databases: Databases,
 }
 
 impl Default for Policy {
@@ -53,6 +89,9 @@ impl Default for Policy {
             deny: Deny::default(),
             redact: Redact::default(),
             services: Services::default(),
+            packages: Packages::default(),
+            certs: Certs::default(),
+            databases: Databases::default(),
         }
     }
 }
@@ -69,7 +108,28 @@ paths    = ["/etc/shadow", "/root", "/etc/vps-agent"]
 groups   = []
 
 [redact]
-patterns = ['(?i)(password|secret|token|api[_-]?key)\s*[=:]\s*\S+', '-----BEGIN [A-Z ]*PRIVATE KEY-----']
+patterns = ['(?i)(password|secret|token|api[_-]?key)\s*[=:]\s*\S+', '-----BEGIN [A-Z ]*PRIVATE KEY-----', '://[^/\s:@]+:[^/\s@]+@']
+
+# System services the agent may start, stop, restart and read logs of, by exact unit name.
+[services]
+allow = []
+
+# apt packages the agent may install, by exact name. Package scripts run as root and
+# dependencies are pulled in automatically: list only what you would install yourself.
+[packages]
+allow = []
+
+# Let's Encrypt certificates. Disabled until email, agree_tos and domains are all set.
+# A domain is an exact name or "*.example.com" for any name under example.com.
+[certs]
+email = ""
+agree_tos = false
+domains = []
+max_per_day = 5
+
+# PostgreSQL roles and databases for managed users (peer authentication by default).
+[databases]
+postgres = false
 "#;
 
 impl Policy {
@@ -98,6 +158,70 @@ impl Policy {
     pub fn service_allowed(&self, unit: &str) -> bool {
         valid_service_unit(unit) && self.services.allow.iter().any(|u| u == unit)
     }
+
+    pub fn package_allowed(&self, name: &str) -> bool {
+        valid_package_name(name) && self.packages.allow.iter().any(|p| p == name)
+    }
+
+    /// Ok when certificates are fully configured and the domain is on the list.
+    pub fn cert_request_allowed(&self, domain: &str) -> Result<(), String> {
+        let c = &self.certs;
+        if !valid_email(&c.email) || !c.agree_tos || c.domains.is_empty() {
+            return Err("certificates are not enabled: set email, agree_tos and domains under [certs] in policy.toml".into());
+        }
+        if !valid_domain(domain) {
+            return Err(format!("{domain:?} is not a plain lowercase domain name"));
+        }
+        let listed = c.domains.iter().any(|entry| match entry.strip_prefix("*.") {
+            Some(parent) => domain.strip_suffix(parent).is_some_and(|head| head.ends_with('.')),
+            None => entry == domain,
+        });
+        if listed {
+            Ok(())
+        } else {
+            Err(format!("{domain} is not in [certs] domains of policy.toml"))
+        }
+    }
+}
+
+/// Debian package name: no versions, releases, paths or options can ride along.
+pub fn valid_package_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (2..=64).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || b"+.-".contains(c))
+        && !name.contains("..")
+}
+
+pub fn valid_domain(domain: &str) -> bool {
+    let labels: Vec<&str> = domain.split('.').collect();
+    domain.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|l| {
+            (1..=63).contains(&l.len())
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+}
+
+fn valid_email(email: &str) -> bool {
+    let ok_char = |b: u8| b.is_ascii_alphanumeric() || b"._+-".contains(&b);
+    match email.split_once('@') {
+        Some((local, host)) => {
+            !local.is_empty() && !local.starts_with('-') && local.bytes().all(ok_char) && valid_domain(host)
+        }
+        None => false,
+    }
+}
+
+/// PostgreSQL database name that needs no quoting and is not one of the built-in databases.
+pub fn valid_db_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=63).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+        && !["postgres", "template0", "template1"].contains(&name)
 }
 
 pub fn valid_service_unit(unit: &str) -> bool {
@@ -268,5 +392,79 @@ allow = ['bot.service', '../evil.service', 'nginx']").unwrap();
         assert!(p.group_denied("docker"));
         assert!(p.group_denied("backup"));
         assert!(!p.group_denied("www-data"));
+    }
+}
+
+#[cfg(test)]
+mod privileged_ops_tests {
+    use super::*;
+
+    #[test]
+    fn everything_is_off_by_default() {
+        let p = Policy::from_toml_str("").unwrap();
+        assert!(!p.package_allowed("python3-venv"));
+        assert!(p.cert_request_allowed("shop.example.com").is_err());
+        assert!(!p.databases.postgres);
+        let d = Policy::from_toml_str(DEFAULT_POLICY_TOML).unwrap();
+        assert!(!d.package_allowed("python3-venv"));
+        assert!(d.cert_request_allowed("shop.example.com").is_err());
+        assert!(!d.databases.postgres);
+    }
+
+    #[test]
+    fn packages_match_by_exact_plain_name() {
+        let p = Policy::from_toml_str("[packages]\nallow = ['python3-venv', 'libstdc++6', 'evil=1.0', '../x']").unwrap();
+        assert!(p.package_allowed("python3-venv"));
+        assert!(p.package_allowed("libstdc++6"));
+        for no in ["python3", "python3-venv=3.12", "python3-venv/noble", "./python3-venv.deb", "-y",
+                   "evil=1.0", "../x", "python3-venv ", "Python3-venv", "a", ""] {
+            assert!(!p.package_allowed(no), "{no:?}");
+        }
+    }
+
+    fn certs(domains: &str) -> Policy {
+        Policy::from_toml_str(&format!(
+            "[certs]\nemail = 'ops@example.com'\nagree_tos = true\ndomains = {domains}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn cert_domains_match_exactly_or_under_a_wildcard_entry() {
+        let p = certs("['shop.example.com', '*.apps.example.com']");
+        for ok in ["shop.example.com", "a.apps.example.com", "a.b.apps.example.com"] {
+            assert_eq!(p.cert_request_allowed(ok), Ok(()), "{ok}");
+        }
+        for no in ["example.com", "evilshop.example.com", "apps.example.com", "xapps.example.com",
+                   "shop.example.com.evil.net", "*.apps.example.com", "SHOP.example.com",
+                   "shop.example.com --pre-hook id", "-d", "localhost", "a..b.com", "-a.example.com", ""] {
+            assert!(p.cert_request_allowed(no).is_err(), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn certs_need_an_email_the_terms_and_a_domain_list() {
+        let ok = "[certs]\nemail = 'ops@example.com'\nagree_tos = true\ndomains = ['a.example.com']";
+        assert!(Policy::from_toml_str(ok).unwrap().cert_request_allowed("a.example.com").is_ok());
+        for broken in [
+            "[certs]\nagree_tos = true\ndomains = ['a.example.com']",
+            "[certs]\nemail = 'ops@example.com'\ndomains = ['a.example.com']",
+            "[certs]\nemail = 'ops@example.com'\nagree_tos = true",
+            "[certs]\nemail = '--pre-hook=id'\nagree_tos = true\ndomains = ['a.example.com']",
+            "[certs]\nemail = 'no-at-sign'\nagree_tos = true\ndomains = ['a.example.com']",
+        ] {
+            assert!(Policy::from_toml_str(broken).unwrap().cert_request_allowed("a.example.com").is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn database_names_are_plain_identifiers() {
+        for ok in ["shop", "shop_prod", "a1", "x"] {
+            assert!(valid_db_name(ok), "{ok}");
+        }
+        for no in ["", "1shop", "Shop", "shop-prod", "shop;drop", "shop db", "postgres", "template0",
+                   "template1", &"a".repeat(64)] {
+            assert!(!valid_db_name(no), "{no:?}");
+        }
     }
 }

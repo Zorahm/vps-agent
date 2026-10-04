@@ -5,7 +5,7 @@ use std::path::Path;
 use vps_agent_core::names::{validate_group_name, validate_user_name};
 use vps_agent_core::nginx::{check_vhost, INCLUDE_FILE, INCLUDE_LINE, SITES_DIR};
 use vps_agent_core::paths::MANAGED_GROUP;
-use vps_agent_core::policy::Policy;
+use vps_agent_core::policy::{valid_db_name, Policy};
 use vps_agent_core::registry::{lock, Registry, UserEntry};
 
 #[derive(Debug)]
@@ -49,8 +49,11 @@ pub fn check_managed(env: &Env, reg: &Registry, name: &str) -> Result<(), Action
 
 pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
     let dir = env.registry_path.parent().unwrap_or(Path::new("."));
-    let _guard = lock(dir).map_err(ActionError::System)?;
+    let guard = lock(dir).map_err(ActionError::System)?;
     let mut reg = Registry::load(env.registry_path).map_err(ActionError::System)?;
+    // Only actions that rewrite the registry keep the lock; apt and certbot run for minutes
+    // and must not block every other helper call meanwhile.
+    let _guard = matches!(action, Action::UserCreate { .. } | Action::UserDelete { .. }).then_some(guard);
     match action {
         Action::UserList => Ok(Value::Array(
             reg.users
@@ -175,6 +178,92 @@ pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
             let (code, output) = env.sys.capture("systemctl", &args).map_err(ActionError::System)?;
             Ok(json!({"exit_code": code, "output": output}))
         }
+        Action::PkgUpdate => {
+            if env.policy.packages.allow.is_empty() {
+                return denied("package installation is not enabled: [packages] allow is empty in policy.toml");
+            }
+            let (code, output) = env.sys.capture("apt-get", &["update"]).map_err(ActionError::System)?;
+            Ok(json!({"exit_code": code, "output": tail(&output)}))
+        }
+        Action::PkgInstall { names } => {
+            if names.is_empty() {
+                return denied("no packages given");
+            }
+            if let Some(bad) = names.iter().find(|n| !env.policy.package_allowed(n)) {
+                return denied(format!("{bad:?} is not in [packages] allow of policy.toml"));
+            }
+            // --force-confold keeps existing config files instead of stopping to ask.
+            let mut args = vec![
+                "install", "-y", "--no-install-recommends", "-o", "Dpkg::Options::=--force-confold", "--",
+            ];
+            args.extend(names.iter().map(String::as_str));
+            let (code, output) = env.sys.capture("apt-get", &args).map_err(ActionError::System)?;
+            Ok(json!({"exit_code": code, "output": tail(&output)}))
+        }
+        Action::CertIssue { domain } => {
+            env.policy.cert_request_allowed(domain).map_err(ActionError::Denied)?;
+            if !env.sys.path_exists("/usr/bin/certbot") {
+                return denied("certbot is not installed on this server (packages: certbot, python3-certbot-nginx)");
+            }
+            let cert_dir = format!("/etc/letsencrypt/live/{domain}");
+            if env.sys.path_exists(&format!("{cert_dir}/fullchain.pem")) {
+                return Ok(json!({"already_present": true, "cert_dir": cert_dir}));
+            }
+            count_cert_attempt(env)?;
+            // Every argument is fixed here: certbot's hook options run commands as root.
+            let (code, output) = env
+                .sys
+                .capture(
+                    "certbot",
+                    &[
+                        "certonly", "--nginx", "--non-interactive", "--agree-tos", "--keep-until-expiring",
+                        "-m", &env.policy.certs.email, "-d", domain,
+                    ],
+                )
+                .map_err(ActionError::System)?;
+            Ok(json!({"exit_code": code, "output": tail(&output), "cert_dir": cert_dir}))
+        }
+        Action::DbCreate { user, name, password } => {
+            if !env.policy.databases.postgres {
+                return denied("databases are not enabled: set postgres = true under [databases] in policy.toml");
+            }
+            check_managed(env, &reg, user)?;
+            if !valid_db_name(name) {
+                return denied(format!("database name {name:?} must be lowercase letters, digits and underscores, and not a built-in database"));
+            }
+            if !env.sys.path_exists("/usr/bin/createuser") {
+                return denied("PostgreSQL is not installed on this server");
+            }
+            let as_postgres = |args: &[&str]| {
+                let mut full = vec!["-u", "postgres", "--"];
+                full.extend_from_slice(args);
+                env.sys.capture("runuser", &full).map_err(ActionError::System)
+            };
+            // The role carries the user's own name: that is what peer authentication matches on.
+            // A second database for the same user finds the role already there.
+            if !pg_exists(env, "SELECT 1 FROM pg_roles WHERE rolname = :'n';\n", user)? {
+                let (code, out) =
+                    as_postgres(&["createuser", "--no-superuser", "--no-createdb", "--no-createrole", "--", user])?;
+                if code != 0 {
+                    return Err(ActionError::System(format!("createuser: {}", out.trim())));
+                }
+            }
+            if pg_exists(env, "SELECT 1 FROM pg_database WHERE datname = :'n';\n", name)? {
+                return denied(format!("database {name} already exists"));
+            }
+            let (code, out) = as_postgres(&["createdb", "--owner", user, "--", name])?;
+            if code != 0 {
+                return Err(ActionError::System(format!("createdb: {}", out.trim())));
+            }
+            if !*password {
+                return Ok(json!({
+                    "database": name, "role": user, "auth": "peer",
+                    "url": format!("postgresql:///{name}?host=/var/run/postgresql"),
+                }));
+            }
+            let env_file = write_db_password(env, user, name)?;
+            Ok(json!({"database": name, "role": user, "auth": "password", "env_file": env_file}))
+        }
         Action::ServiceLogs { unit, lines } => {
             check_service(env, unit)?;
             let n = lines.to_string();
@@ -198,6 +287,77 @@ pub fn execute(env: &Env, action: &Action) -> Result<Value, ActionError> {
             Ok(json!({"removed": target}))
         }
     }
+}
+
+/// The last lines of a long tool output; apt prints thousands.
+fn tail(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    lines[lines.len().saturating_sub(60)..].join("\n")
+}
+
+/// Asks the PostgreSQL catalog whether a role or database exists. The name is bound as the
+/// psql variable `n` and quoted by psql itself. Error text is never inspected: the server
+/// words its messages in its own locale.
+fn pg_exists(env: &Env, sql: &str, name: &str) -> Result<bool, ActionError> {
+    let var = format!("n={name}");
+    let (code, out) = env
+        .sys
+        .capture_input("runuser", &["-u", "postgres", "--", "psql", "-At", "-v", &var], sql.as_bytes())
+        .map_err(ActionError::System)?;
+    if code != 0 {
+        return Err(ActionError::System(format!("cannot query PostgreSQL: {}", out.trim())));
+    }
+    Ok(out.trim() == "1")
+}
+
+/// Counts one certificate attempt for today and refuses once the daily cap is reached.
+fn count_cert_attempt(env: &Env) -> Result<(), ActionError> {
+    let file = env.registry_path.with_file_name("cert-attempts.json");
+    let file = file.to_string_lossy();
+    let today = env.sys.now() / 86_400;
+    let saved: Value = env.sys.read_file(&file).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let count = if saved["day"] == today { saved["count"].as_u64().unwrap_or(0) } else { 0 };
+    if count >= u64::from(env.policy.certs.max_per_day) {
+        return denied(format!(
+            "daily certificate limit reached ({} per day, see [certs] max_per_day)",
+            env.policy.certs.max_per_day
+        ));
+    }
+    env.sys
+        .write_file(&file, json!({"day": today, "count": count + 1}).to_string().as_bytes())
+        .map_err(ActionError::System)
+}
+
+/// Sets a random password on the role and stores the connection string in the user's home.
+/// Returns the file's path; the password itself never leaves this function.
+fn write_db_password(env: &Env, user: &str, name: &str) -> Result<String, ActionError> {
+    let Some(home) = env.sys.home_of(user) else {
+        return Err(ActionError::System(format!("cannot find the home directory of {user}")));
+    };
+    let secret = env.sys.random_hex().map_err(ActionError::System)?;
+    // On stdin, not in arguments: argv is visible to every user through /proc.
+    let sql = format!("ALTER ROLE \"{user}\" PASSWORD '{secret}';\n");
+    let (code, out) = env
+        .sys
+        .capture_input("runuser", &["-u", "postgres", "--", "psql", "-q", "-v", "ON_ERROR_STOP=1"], sql.as_bytes())
+        .map_err(ActionError::System)?;
+    if code != 0 {
+        return Err(ActionError::System(format!("setting the role password failed: {}", out.trim())));
+    }
+    let dir = format!("{home}/.vps-agent");
+    let file = format!("db-{name}.env");
+    let content = format!("DATABASE_URL=postgresql://{user}:{secret}@127.0.0.1:5432/{name}\n");
+    // Written with the user's own privileges: its home is under its control, and root
+    // following a symlink planted there would be a way to overwrite any file.
+    let script = r#"umask 077 && mkdir -p -- "$1" && cat > "$1/$2""#;
+    let (code, out) = env
+        .sys
+        .capture_input("runuser", &["-u", user, "--", "sh", "-c", script, "_", &dir, &file], content.as_bytes())
+        .map_err(ActionError::System)?;
+    if code != 0 {
+        return Err(ActionError::System(format!("writing {dir}/{file} failed: {}", out.trim())));
+    }
+    Ok(format!("{dir}/{file}"))
 }
 
 fn check_service(env: &Env, unit: &str) -> Result<(), ActionError> {
@@ -230,6 +390,12 @@ mod tests_support {
         pub calls: RefCell<Vec<String>>,
         pub fail_on: Option<&'static str>,
         pub files: RefCell<HashMap<String, Vec<u8>>>,
+        /// Seconds added to the fake clock.
+        pub clock: std::cell::Cell<u64>,
+        /// What was fed to commands on stdin; kept apart from `calls` like a real argv is.
+        pub inputs: RefCell<Vec<String>>,
+        /// (substring of the call, exit code, output) for commands that should not just succeed.
+        pub canned: RefCell<Vec<(String, i32, String)>>,
     }
 
     impl System for Fake {
@@ -246,7 +412,17 @@ mod tests_support {
             self.existing_groups.iter().any(|x| x == g)
         }
         fn now(&self) -> u64 {
-            1_700_000_000
+            1_700_000_000 + self.clock.get()
+        }
+        fn home_of(&self, user: &str) -> Option<String> {
+            self.uids.borrow().contains_key(user).then(|| format!("/srv/apps/{user}"))
+        }
+        fn random_hex(&self) -> Result<String, String> {
+            Ok("5ec2e7".repeat(8))
+        }
+        fn capture_input(&self, program: &str, args: &[&str], input: &[u8]) -> Result<(i32, String), String> {
+            self.inputs.borrow_mut().push(String::from_utf8_lossy(input).into_owned());
+            self.capture(program, args)
         }
         fn path_exists(&self, path: &str) -> bool {
             self.files.borrow().contains_key(path)
@@ -263,8 +439,13 @@ mod tests_support {
             Ok(())
         }
         fn capture(&self, program: &str, args: &[&str]) -> Result<(i32, String), String> {
-            self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
-            Ok((0, "captured".into()))
+            let call = format!("{program} {}", args.join(" "));
+            self.calls.borrow_mut().push(call.clone());
+            let canned = self.canned.borrow();
+            match canned.iter().find(|(key, _, _)| call.contains(key.as_str())) {
+                Some((_, code, output)) => Ok((*code, output.clone())),
+                None => Ok((0, "captured".into())),
+            }
         }
         fn run(&self, program: &str, args: &[&str]) -> Result<(), String> {
             self.calls.borrow_mut().push(format!("{program} {}", args.join(" ")));
@@ -547,5 +728,208 @@ mod v1_tests {
         assert!(!sys.path_exists(TARGET));
         let missing = execute(&e, &Action::NginxRemove { name: "shop".into() });
         assert!(matches!(missing, Err(ActionError::Denied(_))));
+    }
+}
+
+#[cfg(test)]
+mod privileged_ops_tests {
+    use super::tests_support::*;
+    use super::*;
+
+    fn policy(toml: &str) -> Policy {
+        Policy::from_toml_str(toml).unwrap()
+    }
+
+    const CERTS: &str = "[certs]\nemail = 'ops@example.com'\nagree_tos = true\ndomains = ['shop.example.com', '*.apps.example.com']\nmax_per_day = 2";
+
+    #[test]
+    fn pkg_install_runs_apt_for_listed_packages_only() {
+        let mut f = fixture("pkg");
+        f.policy = policy("[packages]\nallow = ['python3-venv', 'tmux']");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        let e = env(&f, &sys, &reg);
+        let install = |names: &[&str]| {
+            execute(&e, &Action::PkgInstall { names: names.iter().map(|s| s.to_string()).collect() })
+        };
+        install(&["python3-venv", "tmux"]).unwrap();
+        assert_eq!(
+            sys.calls.borrow()[0],
+            "apt-get install -y --no-install-recommends -o Dpkg::Options::=--force-confold -- python3-venv tmux"
+        );
+        sys.calls.borrow_mut().clear();
+        // One unlisted name refuses the whole call: nothing is installed "partially".
+        for bad in [&["python3-venv", "docker.io"][..], &["-o", "tmux"], &["tmux=3.4"], &[]] {
+            assert!(matches!(install(bad), Err(ActionError::Denied(_))), "{bad:?}");
+        }
+        assert!(sys.calls.borrow().is_empty());
+        execute(&e, &Action::PkgUpdate).unwrap();
+        assert_eq!(sys.calls.borrow()[0], "apt-get update");
+    }
+
+    #[test]
+    fn pkg_update_needs_a_non_empty_allow_list() {
+        let f = fixture("pkg-off");
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        assert!(matches!(execute(&env(&f, &sys, &reg), &Action::PkgUpdate), Err(ActionError::Denied(_))));
+    }
+
+    #[test]
+    fn cert_issue_calls_certbot_with_fixed_arguments() {
+        let mut f = fixture("cert");
+        f.policy = policy(CERTS);
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        sys.write_file("/usr/bin/certbot", b"").unwrap();
+        let e = env(&f, &sys, &reg);
+        let v = execute(&e, &Action::CertIssue { domain: "a.apps.example.com".into() }).unwrap();
+        assert_eq!(
+            sys.calls.borrow()[0],
+            "certbot certonly --nginx --non-interactive --agree-tos --keep-until-expiring -m ops@example.com -d a.apps.example.com"
+        );
+        assert_eq!(v["cert_dir"], "/etc/letsencrypt/live/a.apps.example.com");
+    }
+
+    #[test]
+    fn cert_issue_refuses_unlisted_domains_and_a_missing_certbot() {
+        let mut f = fixture("cert-deny");
+        f.policy = policy(CERTS);
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        let e = env(&f, &sys, &reg);
+        let issue = |d: &str| execute(&e, &Action::CertIssue { domain: d.into() });
+        assert!(matches!(issue("shop.example.com"), Err(ActionError::Denied(_)))); // certbot missing
+        sys.write_file("/usr/bin/certbot", b"").unwrap();
+        assert!(matches!(issue("evil.example.net"), Err(ActionError::Denied(_))));
+        assert!(matches!(issue("shop.example.com --pre-hook id"), Err(ActionError::Denied(_))));
+        assert!(sys.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn cert_issue_counts_attempts_per_day_including_failures() {
+        let mut f = fixture("cert-cap");
+        f.policy = policy(CERTS);
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        sys.write_file("/usr/bin/certbot", b"").unwrap();
+        sys.canned.borrow_mut().push(("certbot".into(), 1, "challenge failed".into()));
+        let e = env(&f, &sys, &reg);
+        let issue = || execute(&e, &Action::CertIssue { domain: "shop.example.com".into() });
+        assert_eq!(issue().unwrap()["exit_code"], 1);
+        assert_eq!(issue().unwrap()["exit_code"], 1);
+        assert!(matches!(issue(), Err(ActionError::Denied(_)))); // max_per_day = 2
+        assert_eq!(sys.calls.borrow().len(), 2);
+        sys.clock.set(86_400);
+        assert!(issue().is_ok());
+    }
+
+    #[test]
+    fn cert_issue_reuses_an_existing_certificate_without_calling_certbot() {
+        let mut f = fixture("cert-have");
+        f.policy = policy(CERTS);
+        let sys = Fake::default();
+        let reg = f.dir.join("users.json");
+        sys.write_file("/usr/bin/certbot", b"").unwrap();
+        sys.write_file("/etc/letsencrypt/live/shop.example.com/fullchain.pem", b"x").unwrap();
+        let v = execute(&env(&f, &sys, &reg), &Action::CertIssue { domain: "shop.example.com".into() }).unwrap();
+        assert_eq!(v["already_present"], true);
+        assert!(sys.calls.borrow().is_empty());
+    }
+
+    fn db_env(tag: &str) -> (Fixture, Fake, std::path::PathBuf) {
+        let mut f = fixture(tag);
+        f.policy = policy("[databases]\npostgres = true");
+        let sys = Fake::default();
+        sys.write_file("/usr/bin/createuser", b"").unwrap();
+        let reg = f.dir.join("users.json");
+        (f, sys, reg)
+    }
+
+    fn db(e: &Env, user: &str, name: &str, password: bool) -> Result<serde_json::Value, ActionError> {
+        execute(e, &Action::DbCreate { user: user.into(), name: name.into(), password })
+    }
+
+    #[test]
+    fn db_create_with_peer_auth_has_no_password_anywhere() {
+        let (f, sys, reg) = db_env("db-peer");
+        let e = env(&f, &sys, &reg);
+        create(&e, "shop").unwrap();
+        sys.calls.borrow_mut().clear();
+        let v = db(&e, "shop", "shop_prod", false).unwrap();
+        assert_eq!(
+            *sys.calls.borrow(),
+            [
+                "runuser -u postgres -- psql -At -v n=shop",
+                "runuser -u postgres -- createuser --no-superuser --no-createdb --no-createrole -- shop",
+                "runuser -u postgres -- psql -At -v n=shop_prod",
+                "runuser -u postgres -- createdb --owner shop -- shop_prod",
+            ]
+        );
+        assert_eq!(v["auth"], "peer");
+        assert_eq!(v["url"], "postgresql:///shop_prod?host=/var/run/postgresql");
+        // Only the two catalog lookups went to stdin, and they quote the name through psql.
+        assert_eq!(sys.inputs.borrow().len(), 2);
+        assert!(sys.inputs.borrow().iter().all(|sql| sql.contains(":'n'") && !sql.contains("shop")));
+        assert!(!v.to_string().contains("5ec2e7"));
+    }
+
+    #[test]
+    fn db_create_with_password_never_returns_or_exposes_it_in_arguments() {
+        let (f, sys, reg) = db_env("db-pass");
+        let e = env(&f, &sys, &reg);
+        create(&e, "shop").unwrap();
+        sys.calls.borrow_mut().clear();
+        let v = db(&e, "shop", "shop_prod", true).unwrap();
+        let secret = "5ec2e7".repeat(8);
+        assert_eq!(v["auth"], "password");
+        assert_eq!(v["env_file"], "/srv/apps/shop/.vps-agent/db-shop_prod.env");
+        assert!(!v.to_string().contains(&secret));
+        // Arguments are visible in `ps` to every user; the secret travels on stdin only.
+        assert!(!sys.calls.borrow().iter().any(|c| c.contains(&secret)));
+        let inputs = sys.inputs.borrow();
+        assert!(inputs[2].contains("ALTER ROLE \"shop\" PASSWORD") && inputs[2].contains(&secret));
+        assert_eq!(inputs[3], format!("DATABASE_URL=postgresql://shop:{secret}@127.0.0.1:5432/shop_prod\n"));
+        // The file is written as the app user, so a symlink planted in its home cannot aim root at /etc.
+        assert!(sys.calls.borrow().iter().any(|c| c.starts_with("runuser -u shop -- sh -c ")));
+    }
+
+    #[test]
+    fn db_create_tolerates_an_existing_role_but_not_an_existing_database() {
+        let (f, sys, reg) = db_env("db-exists");
+        let e = env(&f, &sys, &reg);
+        create(&e, "shop").unwrap();
+        // Existence is asked from the catalog, not read off error text: the server words
+        // its errors in its own locale ("роль уже существует").
+        sys.canned.borrow_mut().push(("psql -At -v n=shop".into(), 0, "1\n".into()));
+        sys.canned.borrow_mut().push(("createuser".into(), 1, "ОШИБКА: роль \"shop\" уже существует".into()));
+        sys.calls.borrow_mut().clear();
+        assert!(db(&e, "shop", "second", false).is_ok());
+        assert!(!sys.calls.borrow().iter().any(|c| c.contains("createuser")));
+
+        sys.canned.borrow_mut().push(("psql -At -v n=second".into(), 0, "1\n".into()));
+        sys.calls.borrow_mut().clear();
+        assert!(matches!(db(&e, "shop", "second", false), Err(ActionError::Denied(_))));
+        assert!(!sys.calls.borrow().iter().any(|c| c.contains("createdb")));
+    }
+
+    #[test]
+    fn db_create_is_refused_when_off_unmanaged_misnamed_or_without_postgres() {
+        let (f, sys, reg) = db_env("db-deny");
+        let e = env(&f, &sys, &reg);
+        create(&e, "shop").unwrap();
+        sys.calls.borrow_mut().clear();
+        for (user, name) in [("root", "x"), ("postgres", "x"), ("shop", "postgres"), ("shop", "a;b"), ("shop", "A")] {
+            assert!(matches!(db(&e, user, name, false), Err(ActionError::Denied(_))), "{user} {name}");
+        }
+        sys.remove_file("/usr/bin/createuser").unwrap();
+        assert!(matches!(db(&e, "shop", "ok", false), Err(ActionError::Denied(_))));
+
+        let off = fixture("db-off");
+        sys.write_file("/usr/bin/createuser", b"").unwrap();
+        let reg_off = off.dir.join("users.json");
+        std::fs::copy(&reg, &reg_off).unwrap();
+        assert!(matches!(db(&env(&off, &sys, &reg_off), "shop", "ok", false), Err(ActionError::Denied(_))));
+        assert!(sys.calls.borrow().is_empty());
     }
 }

@@ -3,6 +3,7 @@ pub mod fs;
 pub mod host;
 pub mod image;
 pub mod jobs;
+pub mod provision;
 pub mod screenshot;
 pub mod service;
 pub mod session;
