@@ -1,0 +1,11 @@
+[package]
+name = "vps-agent-mux"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rmcp = { version = "3.5.0", features = ["server", "client", "transport-io", "transport-child-process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std", "time", "sync"] }
