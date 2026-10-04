@@ -42,6 +42,16 @@ Do not run apps as `agent`. For each app:
 | Move a binary file | `fs_upload`, `fs_download` |
 | Look at an image or a rendered page | `view_image`, `screenshot` |
 | Server health | `sysinfo` |
+| A missing system package | `pkg_install` |
+| A PostgreSQL database for an app | `db_create` |
+| A TLS certificate for a domain | `cert_issue` |
+| Restart an app that runs as a system service | `system_service_control` |
+
+The last four go through a root helper and work only for what the administrator listed in the server's policy: package names, domains, service units. A refusal that names a policy section ("not in [packages] allow") is the administrator's decision. Tell the person which line to add; do not look for another way to get the same effect.
+
+`db_create` gives the app passwordless access through the Unix socket: put the returned `url` into the app's configuration as it is. If you asked for `password: true`, you get a path to an env file instead. Point the app at that file (for example `EnvironmentFile=` in its unit) and do not read it: the password is not yours to see.
+
+`cert_issue` needs the domain's DNS to point at this server already, and attempts are limited per day. Check the DNS with `exec` (`getent hosts <domain>`) before the first attempt rather than spending one on a domain that cannot validate.
 
 `exec` returns the first 50 and last 150 lines. When `truncated` is true and you need the middle, read `log_path` with `fs_read` by line range instead of rerunning the command. `job_output` pages by byte offset: pass the previous `next_offset`.
 
